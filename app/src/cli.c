@@ -111,6 +111,8 @@ enum {
     OPT_RENDER_FIT,
     OPT_IGNORE_VIDEO_ENCODER_CONSTRAINTS,
     OPT_NO_TERMINAL_TITLE,
+    OPT_NO_SYNC,
+    OPT_SYNC_PORT,
 };
 
 struct sc_option {
@@ -706,6 +708,18 @@ static const struct sc_option options[] = {
         .longopt_id = OPT_NO_WINDOW_ASPECT_RATIO_LOCK,
         .longopt = "no-window-aspect-ratio-lock",
         .text = "Disable window aspect ratio lock.",
+    },
+    {
+        .longopt_id = OPT_NO_SYNC,
+        .longopt = "no-sync",
+        .text = "Disable multi-instance input sync UI and bus.",
+    },
+    {
+        .longopt_id = OPT_SYNC_PORT,
+        .longopt = "sync-port",
+        .argdesc = "port",
+        .text = "TCP port for multi-instance input sync on localhost.\n"
+                "Default is 27183.",
     },
     {
         .longopt_id = OPT_ORIENTATION,
@@ -2922,6 +2936,14 @@ parse_args_with_getopt(struct scrcpy_cli_args *args, int argc, char *argv[],
                 break;
             case OPT_NO_WINDOW_ASPECT_RATIO_LOCK:
                 opts->window_aspect_ratio_lock = false;
+                break;
+            case OPT_NO_SYNC:
+                opts->sync = false;
+                break;
+            case OPT_SYNC_PORT:
+                if (!parse_port(optarg, &opts->sync_port)) {
+                    return false;
+                }
                 break;
             case OPT_KEEP_ACTIVE:
                 opts->keep_active = true;

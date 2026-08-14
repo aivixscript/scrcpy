@@ -346,6 +346,8 @@ struct scrcpy_options {
     bool flex_display;
     bool ignore_video_encoder_constraints;
     bool update_terminal_title;
+    bool sync; // multi-instance input sync UI + bus
+    uint16_t sync_port;
 };
 
 extern const struct scrcpy_options scrcpy_options_default;

@@ -47,6 +47,7 @@
 # include "v4l2_sink.h"
 #endif
 #include "video_regulator.h"
+#include "sync_bus.h"
 
 struct scrcpy {
     struct sc_server server;
@@ -63,6 +64,7 @@ struct scrcpy {
     struct sc_video_regulator v4l2_regulator;
 #endif
     struct sc_controller controller;
+    struct sc_sync sync;
     struct sc_file_pusher file_pusher;
 #ifdef HAVE_USB
     struct sc_usb usb;
@@ -353,6 +355,7 @@ scrcpy(struct scrcpy_options *options) {
 #endif
     bool controller_initialized = false;
     bool controller_started = false;
+    bool sync_initialized = false;
     bool screen_initialized = false;
     bool timeout_initialized = false;
     bool timeout_started = false;
@@ -604,6 +607,21 @@ scrcpy(struct scrcpy_options *options) {
         }
         controller_initialized = true;
 
+        if (options->sync && options->window) {
+            if (!sc_sync_init(&s->sync, &s->controller, options->sync_port)) {
+                goto end;
+            }
+            sync_initialized = true;
+            s->controller.sync = &s->sync;
+            if (!sc_sync_start(&s->sync)) {
+                // Non-fatal: continue without sync bus
+                LOGW("Input sync bus unavailable, SYNC button disabled");
+                sc_sync_destroy(&s->sync);
+                sync_initialized = false;
+                s->controller.sync = NULL;
+            }
+        }
+
         controller = &s->controller;
 
 #ifdef HAVE_USB
@@ -782,6 +800,8 @@ aoa_complete:
             .mipmaps = options->mipmaps,
             .fullscreen = options->fullscreen,
             .start_fps_counter = options->start_fps_counter,
+            .sync = s->controller.sync,
+            .overlay_enabled = options->sync && !!s->controller.sync,
         };
 
         if (!sc_screen_init(&s->screen, &screen_params)) {
@@ -924,6 +944,10 @@ end:
         sc_usb_stop(&s->usb);
     }
 #endif
+    if (sync_initialized) {
+        s->controller.sync = NULL;
+        sc_sync_stop(&s->sync);
+    }
     if (controller_started) {
         sc_controller_stop(&s->controller);
     }
@@ -1009,6 +1033,10 @@ end:
 
     if (controller_started) {
         sc_controller_join(&s->controller);
+    }
+    if (sync_initialized) {
+        sc_sync_destroy(&s->sync);
+        sync_initialized = false;
     }
     if (controller_initialized) {
         sc_controller_destroy(&s->controller);

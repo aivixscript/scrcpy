@@ -33,6 +33,7 @@ src = [
     'src/screen.c',
     'src/sdl_hints.c',
     'src/server.c',
+    'src/sync_bus.c',
     'src/texture.c',
     'src/version.c',
     'src/video_regulator.c',

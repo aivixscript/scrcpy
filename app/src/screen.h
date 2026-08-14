@@ -28,6 +28,20 @@
 # define SC_DISPLAY_FORCE_OPENGL_CORE_PROFILE
 #endif
 
+struct sc_sync;
+
+enum sc_overlay_button_id {
+    SC_OVERLAY_BTN_SYNC = 0,
+    SC_OVERLAY_BTN_BACK,
+    SC_OVERLAY_BTN_HOME,
+    SC_OVERLAY_BTN_COUNT,
+};
+
+struct sc_overlay_button {
+    SDL_FRect rect;
+    const char *label;
+};
+
 struct sc_screen {
     struct sc_frame_sink frame_sink; // frame sink trait
 
@@ -41,6 +55,7 @@ struct sc_screen {
     bool flex_display;
 
     struct sc_controller *controller;
+    struct sc_sync *sync;
 
     struct sc_screen_bg_color {
         uint8_t r;
@@ -107,6 +122,9 @@ struct sc_screen {
         sc_tick time; // 0 means none
         struct sc_size size;
     } resize_tracker;
+
+    struct sc_overlay_button overlay_buttons[SC_OVERLAY_BTN_COUNT];
+    bool overlay_enabled;
 };
 
 struct sc_screen_params {
@@ -144,6 +162,9 @@ struct sc_screen_params {
 
     bool fullscreen;
     bool start_fps_counter;
+
+    struct sc_sync *sync;
+    bool overlay_enabled;
 };
 
 // initialize screen, create window, renderer and texture (window is hidden)

@@ -12,6 +12,8 @@
 #include "util/thread.h"
 #include "util/vecdeque.h"
 
+struct sc_sync; // sync_bus.h
+
 struct sc_control_msg_queue SC_VECDEQUE(struct sc_control_msg);
 
 struct sc_controller {
@@ -20,6 +22,8 @@ struct sc_controller {
     sc_mutex mutex;
     sc_cond msg_cond;
     bool stopped;
+
+    struct sc_sync *sync; // optional input sync bus
 
     struct sc_control_msg_queue queue;
 

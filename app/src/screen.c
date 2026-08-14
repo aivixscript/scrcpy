@@ -7,12 +7,152 @@
 #include "events.h"
 #include "icon.h"
 #include "options.h"
+#include "android/input.h"
+#include "android/keycodes.h"
+#include "sync_bus.h"
 #include "util/log.h"
 #include "util/sdl.h"
 
 #define DISPLAY_MARGINS 96
+#define SC_OVERLAY_BTN_W 88.f
+#define SC_OVERLAY_BTN_H 28.f
+#define SC_OVERLAY_BTN_PAD 8.f
 
 #define DOWNCAST(SINK) container_of(SINK, struct sc_screen, frame_sink)
+
+static void
+sc_screen_render(struct sc_screen *screen, bool update_content_rect);
+
+static void
+sc_screen_layout_overlay(struct sc_screen *screen) {
+    if (!screen->overlay_enabled) {
+        return;
+    }
+
+    int w = 0;
+    int h = 0;
+    SDL_GetWindowSize(screen->window, &w, &h);
+
+    float x = (float) w - SC_OVERLAY_BTN_PAD - SC_OVERLAY_BTN_W;
+    float y = SC_OVERLAY_BTN_PAD;
+
+    static const char *labels[SC_OVERLAY_BTN_COUNT] = {
+        "SYNC",
+        "BACK",
+        "HOME",
+    };
+
+    for (int i = 0; i < SC_OVERLAY_BTN_COUNT; ++i) {
+        screen->overlay_buttons[i].label = labels[i];
+        screen->overlay_buttons[i].rect = (SDL_FRect) {
+            .x = x,
+            .y = y + i * (SC_OVERLAY_BTN_H + SC_OVERLAY_BTN_PAD),
+            .w = SC_OVERLAY_BTN_W,
+            .h = SC_OVERLAY_BTN_H,
+        };
+    }
+}
+
+static void
+sc_screen_draw_overlay(struct sc_screen *screen) {
+    if (!screen->overlay_enabled || !screen->window_shown) {
+        return;
+    }
+
+    sc_screen_layout_overlay(screen);
+    SDL_Renderer *renderer = screen->renderer;
+    bool sync_on = screen->sync && sc_sync_is_enabled(screen->sync);
+
+    for (int i = 0; i < SC_OVERLAY_BTN_COUNT; ++i) {
+        struct sc_overlay_button *btn = &screen->overlay_buttons[i];
+        bool active = (i == SC_OVERLAY_BTN_SYNC) && sync_on;
+
+        if (active) {
+            SDL_SetRenderDrawColor(renderer, 40, 160, 70, 220);
+        } else {
+            SDL_SetRenderDrawColor(renderer, 30, 30, 30, 200);
+        }
+        SDL_RenderFillRect(renderer, &btn->rect);
+        SDL_SetRenderDrawColor(renderer, 220, 220, 220, 255);
+        SDL_RenderRect(renderer, &btn->rect);
+
+        const char *label = btn->label;
+        if (i == SC_OVERLAY_BTN_SYNC) {
+            label = sync_on ? "SYNC ON" : "SYNC";
+        }
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+        float tx = btn->rect.x + 8.f;
+        float ty = btn->rect.y + (btn->rect.h - 8.f) / 2.f;
+        SDL_RenderDebugText(renderer, tx, ty, label);
+    }
+}
+
+static void
+sc_screen_inject_key_click(struct sc_screen *screen,
+                           enum android_keycode keycode) {
+    if (!screen->controller) {
+        return;
+    }
+
+    struct sc_control_msg down = {
+        .type = SC_CONTROL_MSG_TYPE_INJECT_KEYCODE,
+        .inject_keycode = {
+            .action = AKEY_EVENT_ACTION_DOWN,
+            .keycode = keycode,
+            .repeat = 0,
+            .metastate = AMETA_NONE,
+        },
+    };
+    struct sc_control_msg up = down;
+    up.inject_keycode.action = AKEY_EVENT_ACTION_UP;
+
+    sc_controller_push_msg(screen->controller, &down);
+    sc_controller_push_msg(screen->controller, &up);
+}
+
+static bool
+sc_screen_handle_overlay_event(struct sc_screen *screen,
+                               const SDL_Event *event) {
+    if (!screen->overlay_enabled) {
+        return false;
+    }
+    if (event->type != SDL_EVENT_MOUSE_BUTTON_DOWN
+            || event->button.button != SDL_BUTTON_LEFT) {
+        return false;
+    }
+
+    sc_screen_layout_overlay(screen);
+    float x = event->button.x;
+    float y = event->button.y;
+
+    for (int i = 0; i < SC_OVERLAY_BTN_COUNT; ++i) {
+        SDL_FRect *r = &screen->overlay_buttons[i].rect;
+        if (x < r->x || x >= r->x + r->w || y < r->y || y >= r->y + r->h) {
+            continue;
+        }
+
+        switch (i) {
+            case SC_OVERLAY_BTN_SYNC:
+                if (screen->sync) {
+                    sc_sync_set_enabled(screen->sync,
+                                       !sc_sync_is_enabled(screen->sync));
+                    sc_screen_render(screen, false);
+                }
+                break;
+            case SC_OVERLAY_BTN_BACK:
+                sc_screen_inject_key_click(screen, AKEYCODE_BACK);
+                break;
+            case SC_OVERLAY_BTN_HOME:
+                sc_screen_inject_key_click(screen, AKEYCODE_HOME);
+                break;
+            default:
+                break;
+        }
+        return true;
+    }
+
+    return false;
+}
 
 static void
 set_aspect_ratio(struct sc_screen *screen, struct sc_size content_size) {
@@ -306,6 +446,7 @@ sc_screen_render(struct sc_screen *screen, bool update_content_rect) {
     }
 
 end:
+    sc_screen_draw_overlay(screen);
     sc_sdl_render_present(renderer);
 }
 
@@ -484,6 +625,8 @@ bool
 sc_screen_init(struct sc_screen *screen,
                const struct sc_screen_params *params) {
     screen->controller = params->controller;
+    screen->sync = params->sync;
+    screen->overlay_enabled = params->overlay_enabled;
 
     screen->resize_pending = false;
     screen->window_shown = false;
@@ -933,6 +1076,9 @@ sc_screen_apply_frame(struct sc_screen *screen, bool can_resize) {
 
         // frame dimension changed
         screen->frame_size = new_frame_size;
+        if (screen->sync) {
+            sc_sync_set_frame_size(screen->sync, screen->frame_size);
+        }
 
         struct sc_size new_content_size =
             get_oriented_size(new_frame_size, screen->orientation);
@@ -1142,6 +1288,9 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
             free(size);
             screen->content_size = get_oriented_size(screen->frame_size,
                                                      screen->orientation);
+            if (screen->sync) {
+                sc_sync_set_frame_size(screen->sync, screen->frame_size);
+            }
             sc_screen_show_initial_window(screen);
 
             if (sc_screen_is_relative_mode(screen)) {
@@ -1217,6 +1366,10 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
     if (sc_screen_is_relative_mode(screen)
             && sc_mouse_capture_handle_event(&screen->mc, event)) {
         // The mouse capture handler consumed the event
+        return;
+    }
+
+    if (sc_screen_handle_overlay_event(screen, event)) {
         return;
     }
 

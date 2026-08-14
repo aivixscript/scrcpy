@@ -2,6 +2,7 @@
 
 #include <assert.h>
 
+#include "sync_bus.h"
 #include "util/log.h"
 
 // Drop droppable events above this limit
@@ -58,6 +59,7 @@ sc_controller_init(struct sc_controller *controller, sc_socket control_socket,
 
     controller->control_socket = control_socket;
     controller->stopped = false;
+    controller->sync = NULL;
 
     controller->resize_display.width = 0;
     controller->resize_display.height = 0;
@@ -121,6 +123,10 @@ sc_controller_push_msg(struct sc_controller *controller,
     // Otherwise, the msg is discarded
 
     sc_mutex_unlock(&controller->mutex);
+
+    if (pushed && controller->sync) {
+        sc_sync_broadcast(controller->sync, msg);
+    }
 
     return pushed;
 }
