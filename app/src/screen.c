@@ -14,14 +14,48 @@
 #include "util/sdl.h"
 
 #define DISPLAY_MARGINS 96
-#define SC_OVERLAY_BTN_W 88.f
-#define SC_OVERLAY_BTN_H 28.f
-#define SC_OVERLAY_BTN_PAD 8.f
+#define SC_OVERLAY_BTN_W 72.f
+#define SC_OVERLAY_BTN_H 72.f
+#define SC_OVERLAY_BTN_PAD 14.f
+#define SC_SIDEBAR_WIDTH ((uint16_t) (SC_OVERLAY_BTN_PAD * 2 + SC_OVERLAY_BTN_W))
 
 #define DOWNCAST(SINK) container_of(SINK, struct sc_screen, frame_sink)
 
 static void
 sc_screen_render(struct sc_screen *screen, bool update_content_rect);
+
+static uint16_t
+sc_screen_sidebar_width(const struct sc_screen *screen) {
+    return screen->overlay_enabled ? SC_SIDEBAR_WIDTH : 0;
+}
+
+static struct sc_size
+sc_screen_with_sidebar(struct sc_screen *screen, struct sc_size size) {
+    size.width += sc_screen_sidebar_width(screen);
+    return size;
+}
+
+static struct sc_size
+sc_screen_video_area_size(struct sc_screen *screen) {
+    struct sc_size window_size = sc_sdl_get_window_size(screen->window);
+    uint16_t sidebar = sc_screen_sidebar_width(screen);
+    if (window_size.width > sidebar) {
+        window_size.width -= sidebar;
+    } else {
+        window_size.width = 1;
+    }
+    return window_size;
+}
+
+static float
+sc_screen_sidebar_x(struct sc_screen *screen) {
+    struct sc_size window_size = sc_sdl_get_window_size(screen->window);
+    uint16_t sidebar = sc_screen_sidebar_width(screen);
+    if (window_size.width <= sidebar) {
+        return 0;
+    }
+    return (float) (window_size.width - sidebar);
+}
 
 static void
 sc_screen_layout_overlay(struct sc_screen *screen) {
@@ -29,28 +63,107 @@ sc_screen_layout_overlay(struct sc_screen *screen) {
         return;
     }
 
-    int w = 0;
-    int h = 0;
-    SDL_GetWindowSize(screen->window, &w, &h);
-
-    float x = (float) w - SC_OVERLAY_BTN_PAD - SC_OVERLAY_BTN_W;
+    float x = sc_screen_sidebar_x(screen) + SC_OVERLAY_BTN_PAD;
     float y = SC_OVERLAY_BTN_PAD;
 
-    static const char *labels[SC_OVERLAY_BTN_COUNT] = {
-        "SYNC",
-        "BACK",
-        "HOME",
-        "KB",
-    };
-
     for (int i = 0; i < SC_OVERLAY_BTN_COUNT; ++i) {
-        screen->overlay_buttons[i].label = labels[i];
+        screen->overlay_buttons[i].label = NULL;
         screen->overlay_buttons[i].rect = (SDL_FRect) {
             .x = x,
             .y = y + i * (SC_OVERLAY_BTN_H + SC_OVERLAY_BTN_PAD),
             .w = SC_OVERLAY_BTN_W,
             .h = SC_OVERLAY_BTN_H,
         };
+    }
+}
+
+static void
+sc_overlay_fill(SDL_Renderer *renderer, float x, float y, float w, float h) {
+    SDL_FRect rect = {x, y, w, h};
+    SDL_RenderFillRect(renderer, &rect);
+}
+
+static void
+sc_overlay_triangle(SDL_Renderer *renderer, SDL_FPoint a, SDL_FPoint b,
+                    SDL_FPoint c, SDL_FColor color) {
+    SDL_Vertex verts[3] = {
+        {.position = a, .color = color},
+        {.position = b, .color = color},
+        {.position = c, .color = color},
+    };
+    SDL_RenderGeometry(renderer, NULL, verts, 3, NULL, 0);
+}
+
+static SDL_FColor
+sc_overlay_icon_color(bool active) {
+    if (active) {
+        return (SDL_FColor) {1.f, 1.f, 1.f, 1.f};
+    }
+    return (SDL_FColor) {0.92f, 0.93f, 0.95f, 1.f};
+}
+
+static void
+sc_overlay_draw_icon(SDL_Renderer *renderer, int id, const SDL_FRect *btn,
+                     bool active) {
+    SDL_FColor col = sc_overlay_icon_color(active);
+    SDL_SetRenderDrawColorFloat(renderer, col.r, col.g, col.b, col.a);
+
+    float cx = btn->x + btn->w / 2.f;
+    float cy = btn->y + btn->h / 2.f;
+    float s = MIN(btn->w, btn->h) * 0.28f;
+
+    switch (id) {
+        case SC_OVERLAY_BTN_SYNC:
+            // Two opposing arrows (sync)
+            sc_overlay_fill(renderer, cx - s, cy - s * 0.55f, s * 1.35f, s * 0.32f);
+            sc_overlay_triangle(renderer,
+                                (SDL_FPoint) {cx + s * 0.45f, cy - s * 0.95f},
+                                (SDL_FPoint) {cx + s, cy - s * 0.38f},
+                                (SDL_FPoint) {cx + s * 0.45f, cy + 0.18f * s},
+                                col);
+            sc_overlay_fill(renderer, cx - s * 0.35f, cy + s * 0.22f, s * 1.35f,
+                            s * 0.32f);
+            sc_overlay_triangle(renderer,
+                                (SDL_FPoint) {cx - s * 0.45f, cy + s * 0.95f},
+                                (SDL_FPoint) {cx - s, cy + s * 0.38f},
+                                (SDL_FPoint) {cx - s * 0.45f, cy - 0.18f * s},
+                                col);
+            break;
+        case SC_OVERLAY_BTN_BACK:
+            sc_overlay_triangle(renderer,
+                                (SDL_FPoint) {cx + s * 0.55f, cy - s},
+                                (SDL_FPoint) {cx + s * 0.55f, cy + s},
+                                (SDL_FPoint) {cx - s * 0.75f, cy},
+                                col);
+            break;
+        case SC_OVERLAY_BTN_HOME:
+            sc_overlay_triangle(renderer,
+                                (SDL_FPoint) {cx, cy - s},
+                                (SDL_FPoint) {cx + s, cy - s * 0.05f},
+                                (SDL_FPoint) {cx - s, cy - s * 0.05f},
+                                col);
+            sc_overlay_fill(renderer, cx - s * 0.55f, cy - s * 0.05f, s * 1.1f,
+                            s * 0.95f);
+            sc_overlay_fill(renderer, cx - s * 0.18f, cy + s * 0.15f, s * 0.36f,
+                            s * 0.75f);
+            break;
+        case SC_OVERLAY_BTN_KB:
+            sc_overlay_fill(renderer, cx - s, cy - s * 0.55f, s * 2.f, s * 1.25f);
+            SDL_SetRenderDrawColor(renderer, 30, 30, 34, 255);
+            for (int row = 0; row < 3; ++row) {
+                int keys = row == 2 ? 3 : 4;
+                float kw = s * 0.28f;
+                float gap = s * 0.12f;
+                float total = keys * kw + (keys - 1) * gap;
+                float kx = cx - total / 2.f;
+                float ky = cy - s * 0.32f + row * (kw + gap);
+                for (int k = 0; k < keys; ++k) {
+                    sc_overlay_fill(renderer, kx + k * (kw + gap), ky, kw, kw);
+                }
+            }
+            break;
+        default:
+            break;
     }
 }
 
@@ -62,6 +175,28 @@ sc_screen_draw_overlay(struct sc_screen *screen) {
 
     sc_screen_layout_overlay(screen);
     SDL_Renderer *renderer = screen->renderer;
+    int win_w = 0;
+    int win_h = 0;
+    SDL_GetWindowSize(screen->window, &win_w, &win_h);
+    float sidebar_w = (float) sc_screen_sidebar_width(screen);
+
+    SDL_FRect sidebar = {
+        .x = (float) win_w - sidebar_w,
+        .y = 0,
+        .w = sidebar_w,
+        .h = (float) win_h,
+    };
+    SDL_SetRenderDrawColor(renderer, 24, 24, 28, 255);
+    SDL_RenderFillRect(renderer, &sidebar);
+    SDL_SetRenderDrawColor(renderer, 70, 70, 78, 255);
+    SDL_FRect divider = {
+        .x = sidebar.x,
+        .y = 0,
+        .w = 1.f,
+        .h = sidebar.h,
+    };
+    SDL_RenderFillRect(renderer, &divider);
+
     bool sync_on = screen->sync && sc_sync_is_enabled(screen->sync);
 
     for (int i = 0; i < SC_OVERLAY_BTN_COUNT; ++i) {
@@ -69,22 +204,14 @@ sc_screen_draw_overlay(struct sc_screen *screen) {
         bool active = (i == SC_OVERLAY_BTN_SYNC) && sync_on;
 
         if (active) {
-            SDL_SetRenderDrawColor(renderer, 40, 160, 70, 220);
+            SDL_SetRenderDrawColor(renderer, 40, 160, 70, 255);
         } else {
-            SDL_SetRenderDrawColor(renderer, 30, 30, 30, 200);
+            SDL_SetRenderDrawColor(renderer, 42, 42, 48, 255);
         }
         SDL_RenderFillRect(renderer, &btn->rect);
-        SDL_SetRenderDrawColor(renderer, 220, 220, 220, 255);
+        SDL_SetRenderDrawColor(renderer, 90, 90, 98, 255);
         SDL_RenderRect(renderer, &btn->rect);
-
-        const char *label = btn->label;
-        if (i == SC_OVERLAY_BTN_SYNC) {
-            label = sync_on ? "SYNC ON" : "SYNC";
-        }
-        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
-        float tx = btn->rect.x + 8.f;
-        float ty = btn->rect.y + (btn->rect.h - 8.f) / 2.f;
-        SDL_RenderDebugText(renderer, tx, ty, label);
+        sc_overlay_draw_icon(renderer, i, &btn->rect, active);
     }
 }
 
@@ -117,14 +244,44 @@ sc_screen_handle_overlay_event(struct sc_screen *screen,
     if (!screen->overlay_enabled) {
         return false;
     }
-    if (event->type != SDL_EVENT_MOUSE_BUTTON_DOWN
-            || event->button.button != SDL_BUTTON_LEFT) {
+
+    float x = 0;
+    float y = 0;
+    bool is_pointer = false;
+    bool is_left_down = false;
+    switch (event->type) {
+        case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        case SDL_EVENT_MOUSE_BUTTON_UP:
+            x = event->button.x;
+            y = event->button.y;
+            is_pointer = true;
+            is_left_down = event->type == SDL_EVENT_MOUSE_BUTTON_DOWN
+                    && event->button.button == SDL_BUTTON_LEFT;
+            break;
+        case SDL_EVENT_MOUSE_MOTION:
+            x = event->motion.x;
+            y = event->motion.y;
+            is_pointer = true;
+            break;
+        case SDL_EVENT_MOUSE_WHEEL:
+            x = event->wheel.mouse_x;
+            y = event->wheel.mouse_y;
+            is_pointer = true;
+            break;
+        default:
+            break;
+    }
+
+    if (!is_pointer || x < sc_screen_sidebar_x(screen)) {
         return false;
     }
 
+    if (!is_left_down) {
+        // Consume all pointer events on the sidebar so they never hit the game
+        return true;
+    }
+
     sc_screen_layout_overlay(screen);
-    float x = event->button.x;
-    float y = event->button.y;
 
     for (int i = 0; i < SC_OVERLAY_BTN_COUNT; ++i) {
         SDL_FRect *r = &screen->overlay_buttons[i].rect;
@@ -159,7 +316,7 @@ sc_screen_handle_overlay_event(struct sc_screen *screen,
         return true;
     }
 
-    return false;
+    return true;
 }
 
 static void
@@ -167,7 +324,8 @@ set_aspect_ratio(struct sc_screen *screen, struct sc_size content_size) {
     assert(content_size.width && content_size.height);
 
     if (screen->window_aspect_ratio_lock) {
-        float ar = (float) content_size.width / content_size.height;
+        float ar = ((float) content_size.width + sc_screen_sidebar_width(screen))
+                 / content_size.height;
         bool ok = SDL_SetWindowAspectRatio(screen->window, ar, ar);
         if (!ok) {
             LOGW("Could not set window aspect ratio: %s", SDL_GetError());
@@ -374,8 +532,8 @@ sc_screen_update_content_rect(struct sc_screen *screen) {
     // Only upscale video frames, not icon
     bool is_icon = !screen->video || screen->disconnected;
 
-    struct sc_size window_size = sc_sdl_get_window_size(screen->window);
-    compute_content_rect(window_size, screen->content_size, is_icon,
+    struct sc_size video_size = sc_screen_video_area_size(screen);
+    compute_content_rect(video_size, screen->content_size, is_icon,
                          screen->render_fit, &screen->rect);
 }
 
@@ -489,6 +647,10 @@ sc_screen_on_resize(struct sc_screen *screen, const SDL_WindowEvent *event) {
             assert(!(event->data2 & ~0xFFFF));
             uint16_t width = event->data1;
             uint16_t height = event->data2;
+            uint16_t sidebar = sc_screen_sidebar_width(screen);
+            if (width > sidebar) {
+                width -= sidebar;
+            }
 
             struct sc_resize_tracker *tracker = &screen->resize_tracker;
             if (tracker->time
@@ -897,6 +1059,7 @@ sc_screen_show_initial_window(struct sc_screen *screen) {
     struct sc_size window_size =
         get_initial_optimal_size(screen->content_size, screen->req.width,
                                                        screen->req.height);
+    window_size = sc_screen_with_sidebar(screen, window_size);
 
     if (screen->flex_display
             && window_size.width == screen->content_size.width
@@ -995,7 +1158,7 @@ resize_for_content(struct sc_screen *screen, struct sc_size old_content_size,
 
     struct sc_size target_size = new_content_size;
     if (!screen->flex_display) {
-        struct sc_size window_size = sc_sdl_get_window_size(screen->window);
+        struct sc_size window_size = sc_screen_video_area_size(screen);
         // Scale proportionally
         target_size.width = (uint32_t) window_size.width * target_size.width
                           / old_content_size.width;
@@ -1003,6 +1166,7 @@ resize_for_content(struct sc_screen *screen, struct sc_size old_content_size,
                            / old_content_size.height;
     }
     target_size = get_optimal_size(target_size, new_content_size, true);
+    target_size = sc_screen_with_sidebar(screen, target_size);
     assert(is_windowed(screen));
     set_aspect_ratio(screen, new_content_size);
     sc_sdl_set_window_size(screen->window, target_size);
@@ -1018,7 +1182,7 @@ set_content_size(struct sc_screen *screen, struct sc_size new_content_size,
             resize_for_content(screen, screen->content_size, new_content_size);
         } else if (screen->flex_display) {
             // Force a display resize, the client cannot resize in fullscreen
-            struct sc_size size = sc_sdl_get_window_size(screen->window);
+            struct sc_size size = sc_screen_video_area_size(screen);
             sc_screen_request_resize_display(screen, size.width, size.height);
         } else if (!screen->resize_pending) {
             // Store the windowed size to be able to compute the optimal size
@@ -1201,8 +1365,9 @@ sc_screen_resize_to_fit(struct sc_screen *screen) {
     struct sc_size window_size = sc_sdl_get_window_size(screen->window);
 
     if (screen->render_fit == SC_RENDER_FIT_UNSCALED) {
-        struct sc_size content_size = screen->content_size;
-        set_aspect_ratio(screen, content_size);
+        struct sc_size content_size = sc_screen_with_sidebar(screen,
+                                                            screen->content_size);
+        set_aspect_ratio(screen, screen->content_size);
         sc_sdl_set_window_size(screen->window, content_size);
 
         int32_t x_offset = 0;
@@ -1229,19 +1394,21 @@ sc_screen_resize_to_fit(struct sc_screen *screen) {
     assert(screen->render_fit == SC_RENDER_FIT_LETTERBOX);
 
     struct sc_point point = sc_sdl_get_window_position(screen->window);
+    struct sc_size video_size = sc_screen_video_area_size(screen);
 
     struct sc_size optimal_size =
-        get_optimal_size(window_size, screen->content_size, false);
+        get_optimal_size(video_size, screen->content_size, false);
 
     // Center the window related to the device screen
-    assert(optimal_size.width <= window_size.width);
-    assert(optimal_size.height <= window_size.height);
+    assert(optimal_size.width <= video_size.width);
+    assert(optimal_size.height <= video_size.height);
 
     struct sc_point new_position = {
-        .x = point.x + (window_size.width - optimal_size.width) / 2,
-        .y = point.y + (window_size.height - optimal_size.height) / 2,
+        .x = point.x + (video_size.width - optimal_size.width) / 2,
+        .y = point.y + (video_size.height - optimal_size.height) / 2,
     };
 
+    optimal_size = sc_screen_with_sidebar(screen, optimal_size);
     set_aspect_ratio(screen, screen->content_size);
     sc_sdl_set_window_size(screen->window, optimal_size);
     sc_sdl_set_window_position(screen->window, new_position);
@@ -1257,8 +1424,9 @@ sc_screen_resize_to_pixel_perfect(struct sc_screen *screen) {
         return;
     }
 
-    struct sc_size content_size = screen->content_size;
-    set_aspect_ratio(screen, content_size);
+    struct sc_size content_size =
+        sc_screen_with_sidebar(screen, screen->content_size);
+    set_aspect_ratio(screen, screen->content_size);
     sc_sdl_set_window_size(screen->window, content_size);
     LOGD("Resized to pixel-perfect: %ux%u", content_size.width,
                                             content_size.height);
