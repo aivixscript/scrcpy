@@ -40,6 +40,7 @@ sc_screen_layout_overlay(struct sc_screen *screen) {
         "SYNC",
         "BACK",
         "HOME",
+        "KB",
     };
 
     for (int i = 0; i < SC_OVERLAY_BTN_COUNT; ++i) {
@@ -144,6 +145,13 @@ sc_screen_handle_overlay_event(struct sc_screen *screen,
                 break;
             case SC_OVERLAY_BTN_HOME:
                 sc_screen_inject_key_click(screen, AKEYCODE_HOME);
+                break;
+            case SC_OVERLAY_BTN_KB:
+                if (screen->controller) {
+                    struct sc_control_msg msg;
+                    msg.type = SC_CONTROL_MSG_TYPE_OPEN_HARD_KEYBOARD_SETTINGS;
+                    sc_controller_push_msg(screen->controller, &msg);
+                }
                 break;
             default:
                 break;

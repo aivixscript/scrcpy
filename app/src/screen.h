@@ -34,6 +34,7 @@ enum sc_overlay_button_id {
     SC_OVERLAY_BTN_SYNC = 0,
     SC_OVERLAY_BTN_BACK,
     SC_OVERLAY_BTN_HOME,
+    SC_OVERLAY_BTN_KB,
     SC_OVERLAY_BTN_COUNT,
 };
 

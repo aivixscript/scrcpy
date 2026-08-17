@@ -458,6 +458,12 @@ sc_input_manager_process_key(struct sc_input_manager *im,
                 }
             }
             return;
+        case SDLK_ESCAPE:
+            // Android games treat BACK as Escape/pause, not KEYCODE_ESCAPE
+            if (control && im->kp && !paused && !disconnected) {
+                action_back(im, down ? SC_ACTION_DOWN : SC_ACTION_UP);
+            }
+            return;
     }
 
     if (is_shortcut) {

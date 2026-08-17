@@ -13,7 +13,7 @@ echo.
 for /f "tokens=1,2" %%A in ('adb devices') do (
   if /I "%%B"=="device" (
     echo Device: %%A
-    start "scrcpy-%%A" "%~dp0x\app\scrcpy.exe" --serial=%%A --no-window-aspect-ratio-lock --render-fit=stretched %*
+    start "scrcpy-%%A" "%~dp0x\app\scrcpy.exe" --serial=%%A --no-window-aspect-ratio-lock --render-fit=stretched --keyboard=uhid %*
     timeout /t 1 /nobreak >nul
   )
 )
