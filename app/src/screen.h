@@ -18,6 +18,7 @@
 #include "input_manager.h"
 #include "mouse_capture.h"
 #include "options.h"
+#include "sync_bus.h"
 #include "texture.h"
 #include "trait/key_processor.h"
 #include "trait/frame_sink.h"
@@ -27,8 +28,6 @@
 #ifdef __APPLE__
 # define SC_DISPLAY_FORCE_OPENGL_CORE_PROFILE
 #endif
-
-struct sc_sync;
 
 enum sc_overlay_button_id {
     SC_OVERLAY_BTN_SYNC = 0,
@@ -126,6 +125,19 @@ struct sc_screen {
 
     struct sc_overlay_button overlay_buttons[SC_OVERLAY_BTN_COUNT];
     bool overlay_enabled;
+
+    bool sync_menu_open;
+    SDL_FRect sync_menu_rect;
+    SDL_FRect sync_menu_rows[SC_SYNC_MAX_PEERS];
+    uint32_t sync_menu_peer_ids[SC_SYNC_MAX_PEERS];
+    size_t sync_menu_row_count;
+
+    SDL_FRect log_copy_rect;
+#define SC_INPUT_LOG_LINES 48
+#define SC_INPUT_LOG_COLS 96
+    char input_log[SC_INPUT_LOG_LINES][SC_INPUT_LOG_COLS];
+    int input_log_head;
+    int input_log_count;
 };
 
 struct sc_screen_params {
@@ -220,6 +232,9 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event);
 // run the event loop once the device is disconnected
 void
 sc_screen_handle_disconnection(struct sc_screen *screen);
+
+void
+sc_screen_log_input(struct sc_screen *screen, const char *fmt, ...);
 
 // convert point from window coordinates to frame coordinates
 // x and y are expressed in pixels

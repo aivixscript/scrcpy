@@ -1,6 +1,8 @@
 #include "screen.h"
 
 #include <assert.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 #include <SDL3/SDL.h>
 
@@ -18,11 +20,21 @@
 #define SC_OVERLAY_BTN_H 72.f
 #define SC_OVERLAY_BTN_PAD 14.f
 #define SC_SIDEBAR_WIDTH ((uint16_t) (SC_OVERLAY_BTN_PAD * 2 + SC_OVERLAY_BTN_W))
+#define SC_LOG_PANEL_HEIGHT 112
+#define SC_LOG_COPY_W 72.f
+#define SC_LOG_COPY_H 28.f
+#define SC_SYNC_MENU_W 260.f
+#define SC_SYNC_MENU_ROW_H 28.f
 
 #define DOWNCAST(SINK) container_of(SINK, struct sc_screen, frame_sink)
 
 static void
 sc_screen_render(struct sc_screen *screen, bool update_content_rect);
+
+static uint16_t
+sc_screen_log_height(const struct sc_screen *screen) {
+    return screen->overlay_enabled ? SC_LOG_PANEL_HEIGHT : 0;
+}
 
 static uint16_t
 sc_screen_sidebar_width(const struct sc_screen *screen) {
@@ -32,6 +44,7 @@ sc_screen_sidebar_width(const struct sc_screen *screen) {
 static struct sc_size
 sc_screen_with_sidebar(struct sc_screen *screen, struct sc_size size) {
     size.width += sc_screen_sidebar_width(screen);
+    size.height += sc_screen_log_height(screen);
     return size;
 }
 
@@ -39,10 +52,16 @@ static struct sc_size
 sc_screen_video_area_size(struct sc_screen *screen) {
     struct sc_size window_size = sc_sdl_get_window_size(screen->window);
     uint16_t sidebar = sc_screen_sidebar_width(screen);
+    uint16_t log_h = sc_screen_log_height(screen);
     if (window_size.width > sidebar) {
         window_size.width -= sidebar;
     } else {
         window_size.width = 1;
+    }
+    if (window_size.height > log_h) {
+        window_size.height -= log_h;
+    } else {
+        window_size.height = 1;
     }
     return window_size;
 }
@@ -167,6 +186,194 @@ sc_overlay_draw_icon(SDL_Renderer *renderer, int id, const SDL_FRect *btn,
     }
 }
 
+static bool
+sc_frect_contains(const SDL_FRect *r, float x, float y) {
+    return x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;
+}
+
+static void
+sc_overlay_debug_text(SDL_Renderer *renderer, float x, float y,
+                      const char *text) {
+    float sx = 1.f;
+    float sy = 1.f;
+    SDL_GetRenderScale(renderer, &sx, &sy);
+    SDL_SetRenderScale(renderer, 2.f, 2.f);
+    SDL_SetRenderDrawColor(renderer, 230, 230, 235, 255);
+    SDL_RenderDebugText(renderer, x / 2.f, y / 2.f, text);
+    SDL_SetRenderScale(renderer, sx, sy);
+}
+
+void
+sc_screen_log_input(struct sc_screen *screen, const char *fmt, ...) {
+    if (!screen || !screen->overlay_enabled) {
+        return;
+    }
+
+    char line[SC_INPUT_LOG_COLS];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    sc_mutex_lock(&screen->mutex);
+    snprintf(screen->input_log[screen->input_log_head], SC_INPUT_LOG_COLS,
+             "%s", line);
+    screen->input_log_head =
+        (screen->input_log_head + 1) % SC_INPUT_LOG_LINES;
+    if (screen->input_log_count < SC_INPUT_LOG_LINES) {
+        ++screen->input_log_count;
+    }
+    sc_mutex_unlock(&screen->mutex);
+}
+
+static void
+sc_screen_copy_input_log(struct sc_screen *screen) {
+    char buf[SC_INPUT_LOG_LINES * SC_INPUT_LOG_COLS];
+    size_t o = 0;
+    buf[0] = '\0';
+
+    sc_mutex_lock(&screen->mutex);
+    int n = screen->input_log_count;
+    int start = (screen->input_log_head - n + SC_INPUT_LOG_LINES)
+                % SC_INPUT_LOG_LINES;
+    for (int i = 0; i < n; ++i) {
+        int idx = (start + i) % SC_INPUT_LOG_LINES;
+        int written = snprintf(buf + o, sizeof(buf) - o, "%s\n",
+                               screen->input_log[idx]);
+        if (written < 0 || (size_t) written >= sizeof(buf) - o) {
+            break;
+        }
+        o += (size_t) written;
+    }
+    sc_mutex_unlock(&screen->mutex);
+
+    if (!o) {
+        SDL_SetClipboardText("(empty)");
+    } else {
+        SDL_SetClipboardText(buf);
+    }
+    sc_screen_log_input(screen, "copied %d lines", n);
+}
+
+static void
+sc_screen_layout_log(struct sc_screen *screen, int win_w, int win_h) {
+    uint16_t log_h = sc_screen_log_height(screen);
+    screen->log_copy_rect = (SDL_FRect) {
+        .x = (float) win_w - sc_screen_sidebar_width(screen) - SC_LOG_COPY_W
+             - 10.f,
+        .y = (float) win_h - (float) log_h + 8.f,
+        .w = SC_LOG_COPY_W,
+        .h = SC_LOG_COPY_H,
+    };
+}
+
+static void
+sc_screen_draw_log_panel(struct sc_screen *screen, int win_w, int win_h) {
+    uint16_t log_h = sc_screen_log_height(screen);
+    if (!log_h) {
+        return;
+    }
+
+    SDL_Renderer *renderer = screen->renderer;
+    SDL_FRect panel = {
+        .x = 0,
+        .y = (float) win_h - (float) log_h,
+        .w = (float) win_w,
+        .h = (float) log_h,
+    };
+    SDL_SetRenderDrawColor(renderer, 18, 18, 22, 255);
+    SDL_RenderFillRect(renderer, &panel);
+    SDL_SetRenderDrawColor(renderer, 70, 70, 78, 255);
+    SDL_FRect top = {0, panel.y, (float) win_w, 1.f};
+    SDL_RenderFillRect(renderer, &top);
+
+    sc_screen_layout_log(screen, win_w, win_h);
+    SDL_SetRenderDrawColor(renderer, 52, 90, 160, 255);
+    SDL_RenderFillRect(renderer, &screen->log_copy_rect);
+    sc_overlay_debug_text(renderer, screen->log_copy_rect.x + 12.f,
+                          screen->log_copy_rect.y + 6.f, "COPY");
+
+    char lines[SC_INPUT_LOG_LINES][SC_INPUT_LOG_COLS];
+    int n = 0;
+    int start = 0;
+    sc_mutex_lock(&screen->mutex);
+    n = screen->input_log_count;
+    start = (screen->input_log_head - n + SC_INPUT_LOG_LINES)
+            % SC_INPUT_LOG_LINES;
+    for (int i = 0; i < n; ++i) {
+        memcpy(lines[i], screen->input_log[(start + i) % SC_INPUT_LOG_LINES],
+               SC_INPUT_LOG_COLS);
+    }
+    sc_mutex_unlock(&screen->mutex);
+
+    int visible = ((int) log_h - 12) / 10;
+    int from = n > visible ? n - visible : 0;
+    float y = panel.y + 6.f;
+    SDL_SetRenderDrawColor(renderer, 200, 200, 205, 255);
+    float sx = 1.f;
+    float sy = 1.f;
+    SDL_GetRenderScale(renderer, &sx, &sy);
+    for (int i = from; i < n; ++i) {
+        SDL_RenderDebugText(renderer, 8.f, y, lines[i]);
+        y += 10.f;
+    }
+    SDL_SetRenderScale(renderer, sx, sy);
+}
+
+static void
+sc_screen_draw_sync_menu(struct sc_screen *screen) {
+    if (!screen->sync_menu_open || !screen->sync) {
+        screen->sync_menu_row_count = 0;
+        return;
+    }
+
+    struct sc_sync_peer peers[SC_SYNC_MAX_PEERS];
+    size_t n = sc_sync_copy_peers(screen->sync, peers, SC_SYNC_MAX_PEERS);
+    screen->sync_menu_row_count = n;
+
+    SDL_Renderer *renderer = screen->renderer;
+    float rows = n ? (float) n : 1.f;
+    float menu_h = 36.f + rows * SC_SYNC_MENU_ROW_H + 8.f;
+    float x = sc_screen_sidebar_x(screen) - SC_SYNC_MENU_W - 8.f;
+    if (x < 8.f) {
+        x = 8.f;
+    }
+    float y = screen->overlay_buttons[SC_OVERLAY_BTN_SYNC].rect.y;
+    screen->sync_menu_rect = (SDL_FRect) {x, y, SC_SYNC_MENU_W, menu_h};
+
+    SDL_SetRenderDrawColor(renderer, 28, 28, 34, 240);
+    SDL_RenderFillRect(renderer, &screen->sync_menu_rect);
+    SDL_SetRenderDrawColor(renderer, 90, 90, 98, 255);
+    SDL_RenderRect(renderer, &screen->sync_menu_rect);
+    sc_overlay_debug_text(renderer, x + 12.f, y + 8.f, "SYNC TO");
+
+    if (!n) {
+        sc_overlay_debug_text(renderer, x + 12.f, y + 40.f, "no other windows");
+        return;
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        SDL_FRect row = {
+            .x = x + 8.f,
+            .y = y + 36.f + (float) i * SC_SYNC_MENU_ROW_H,
+            .w = SC_SYNC_MENU_W - 16.f,
+            .h = SC_SYNC_MENU_ROW_H - 4.f,
+        };
+        screen->sync_menu_rows[i] = row;
+        screen->sync_menu_peer_ids[i] = peers[i].id;
+        if (peers[i].selected) {
+            SDL_SetRenderDrawColor(renderer, 40, 160, 70, 255);
+        } else {
+            SDL_SetRenderDrawColor(renderer, 42, 42, 48, 255);
+        }
+        SDL_RenderFillRect(renderer, &row);
+        char label[48];
+        snprintf(label, sizeof(label), "%s %s",
+                 peers[i].selected ? "[x]" : "[ ]", peers[i].name);
+        sc_overlay_debug_text(renderer, row.x + 8.f, row.y + 6.f, label);
+    }
+}
+
 static void
 sc_screen_draw_overlay(struct sc_screen *screen) {
     if (!screen->overlay_enabled || !screen->window_shown) {
@@ -179,12 +386,13 @@ sc_screen_draw_overlay(struct sc_screen *screen) {
     int win_h = 0;
     SDL_GetWindowSize(screen->window, &win_w, &win_h);
     float sidebar_w = (float) sc_screen_sidebar_width(screen);
+    uint16_t log_h = sc_screen_log_height(screen);
 
     SDL_FRect sidebar = {
         .x = (float) win_w - sidebar_w,
         .y = 0,
         .w = sidebar_w,
-        .h = (float) win_h,
+        .h = (float) win_h - (float) log_h,
     };
     SDL_SetRenderDrawColor(renderer, 24, 24, 28, 255);
     SDL_RenderFillRect(renderer, &sidebar);
@@ -197,11 +405,12 @@ sc_screen_draw_overlay(struct sc_screen *screen) {
     };
     SDL_RenderFillRect(renderer, &divider);
 
-    bool sync_on = screen->sync && sc_sync_is_enabled(screen->sync);
+    bool sync_on = screen->sync && sc_sync_has_targets(screen->sync);
 
     for (int i = 0; i < SC_OVERLAY_BTN_COUNT; ++i) {
         struct sc_overlay_button *btn = &screen->overlay_buttons[i];
-        bool active = (i == SC_OVERLAY_BTN_SYNC) && sync_on;
+        bool active = (i == SC_OVERLAY_BTN_SYNC)
+                && (sync_on || screen->sync_menu_open);
 
         if (active) {
             SDL_SetRenderDrawColor(renderer, 40, 160, 70, 255);
@@ -213,6 +422,9 @@ sc_screen_draw_overlay(struct sc_screen *screen) {
         SDL_RenderRect(renderer, &btn->rect);
         sc_overlay_draw_icon(renderer, i, &btn->rect, active);
     }
+
+    sc_screen_draw_sync_menu(screen);
+    sc_screen_draw_log_panel(screen, win_w, win_h);
 }
 
 static void
@@ -236,6 +448,13 @@ sc_screen_inject_key_click(struct sc_screen *screen,
 
     sc_controller_push_msg(screen->controller, &down);
     sc_controller_push_msg(screen->controller, &up);
+    if (keycode == AKEYCODE_BACK) {
+        sc_screen_log_input(screen, "BACK");
+    } else if (keycode == AKEYCODE_HOME) {
+        sc_screen_log_input(screen, "HOME");
+    } else {
+        sc_screen_log_input(screen, "KEY %d", (int) keycode);
+    }
 }
 
 static bool
@@ -272,51 +491,90 @@ sc_screen_handle_overlay_event(struct sc_screen *screen,
             break;
     }
 
-    if (!is_pointer || x < sc_screen_sidebar_x(screen)) {
+    if (!is_pointer) {
         return false;
     }
 
+    int win_w = 0;
+    int win_h = 0;
+    SDL_GetWindowSize(screen->window, &win_w, &win_h);
+    uint16_t log_h = sc_screen_log_height(screen);
+    bool in_log = log_h && y >= (float) (win_h - log_h);
+    bool in_sidebar = x >= sc_screen_sidebar_x(screen)
+            && (!log_h || y < (float) (win_h - log_h));
+    bool in_menu = screen->sync_menu_open
+            && sc_frect_contains(&screen->sync_menu_rect, x, y);
+
     if (!is_left_down) {
-        // Consume all pointer events on the sidebar so they never hit the game
-        return true;
+        return in_log || in_sidebar || in_menu;
     }
 
     sc_screen_layout_overlay(screen);
+    sc_screen_layout_log(screen, win_w, win_h);
 
-    for (int i = 0; i < SC_OVERLAY_BTN_COUNT; ++i) {
-        SDL_FRect *r = &screen->overlay_buttons[i].rect;
-        if (x < r->x || x >= r->x + r->w || y < r->y || y >= r->y + r->h) {
-            continue;
-        }
-
-        switch (i) {
-            case SC_OVERLAY_BTN_SYNC:
-                if (screen->sync) {
-                    sc_sync_set_enabled(screen->sync,
-                                       !sc_sync_is_enabled(screen->sync));
-                    sc_screen_render(screen, false);
-                }
+    if (in_menu) {
+        for (size_t i = 0; i < screen->sync_menu_row_count; ++i) {
+            if (sc_frect_contains(&screen->sync_menu_rows[i], x, y)
+                    && screen->sync) {
+                sc_sync_toggle_target(screen->sync,
+                                      screen->sync_menu_peer_ids[i]);
+                sc_screen_render(screen, false);
                 break;
-            case SC_OVERLAY_BTN_BACK:
-                sc_screen_inject_key_click(screen, AKEYCODE_BACK);
-                break;
-            case SC_OVERLAY_BTN_HOME:
-                sc_screen_inject_key_click(screen, AKEYCODE_HOME);
-                break;
-            case SC_OVERLAY_BTN_KB:
-                if (screen->controller) {
-                    struct sc_control_msg msg;
-                    msg.type = SC_CONTROL_MSG_TYPE_OPEN_HARD_KEYBOARD_SETTINGS;
-                    sc_controller_push_msg(screen->controller, &msg);
-                }
-                break;
-            default:
-                break;
+            }
         }
         return true;
     }
 
-    return true;
+    if (in_log) {
+        if (sc_frect_contains(&screen->log_copy_rect, x, y)) {
+            sc_screen_copy_input_log(screen);
+            sc_screen_render(screen, false);
+        }
+        return true;
+    }
+
+    if (in_sidebar) {
+        for (int i = 0; i < SC_OVERLAY_BTN_COUNT; ++i) {
+            SDL_FRect *r = &screen->overlay_buttons[i].rect;
+            if (x < r->x || x >= r->x + r->w || y < r->y || y >= r->y + r->h) {
+                continue;
+            }
+
+            switch (i) {
+                case SC_OVERLAY_BTN_SYNC:
+                    screen->sync_menu_open = !screen->sync_menu_open;
+                    sc_screen_render(screen, false);
+                    break;
+                case SC_OVERLAY_BTN_BACK:
+                    sc_screen_inject_key_click(screen, AKEYCODE_BACK);
+                    break;
+                case SC_OVERLAY_BTN_HOME:
+                    sc_screen_inject_key_click(screen, AKEYCODE_HOME);
+                    break;
+                case SC_OVERLAY_BTN_KB:
+                    if (screen->controller) {
+                        struct sc_control_msg msg;
+                        msg.type =
+                            SC_CONTROL_MSG_TYPE_OPEN_HARD_KEYBOARD_SETTINGS;
+                        sc_controller_push_msg(screen->controller, &msg);
+                        sc_screen_log_input(screen, "KB settings");
+                    }
+                    break;
+                default:
+                    break;
+            }
+            return true;
+        }
+        return true;
+    }
+
+    if (screen->sync_menu_open) {
+        screen->sync_menu_open = false;
+        sc_screen_render(screen, false);
+        return true;
+    }
+
+    return false;
 }
 
 static void
@@ -324,8 +582,8 @@ set_aspect_ratio(struct sc_screen *screen, struct sc_size content_size) {
     assert(content_size.width && content_size.height);
 
     if (screen->window_aspect_ratio_lock) {
-        float ar = ((float) content_size.width + sc_screen_sidebar_width(screen))
-                 / content_size.height;
+    float ar = ((float) content_size.width + sc_screen_sidebar_width(screen))
+             / ((float) content_size.height + sc_screen_log_height(screen));
         bool ok = SDL_SetWindowAspectRatio(screen->window, ar, ar);
         if (!ok) {
             LOGW("Could not set window aspect ratio: %s", SDL_GetError());
@@ -648,8 +906,12 @@ sc_screen_on_resize(struct sc_screen *screen, const SDL_WindowEvent *event) {
             uint16_t width = event->data1;
             uint16_t height = event->data2;
             uint16_t sidebar = sc_screen_sidebar_width(screen);
+            uint16_t log_h = sc_screen_log_height(screen);
             if (width > sidebar) {
                 width -= sidebar;
+            }
+            if (height > log_h) {
+                height -= log_h;
             }
 
             struct sc_resize_tracker *tracker = &screen->resize_tracker;
@@ -797,6 +1059,11 @@ sc_screen_init(struct sc_screen *screen,
     screen->controller = params->controller;
     screen->sync = params->sync;
     screen->overlay_enabled = params->overlay_enabled;
+    screen->sync_menu_open = false;
+    screen->sync_menu_row_count = 0;
+    screen->input_log_head = 0;
+    screen->input_log_count = 0;
+    memset(screen->input_log, 0, sizeof(screen->input_log));
 
     screen->resize_pending = false;
     screen->window_shown = false;
@@ -1483,6 +1750,9 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
                 LOGE("Frame update failed\n");
             }
             sc_input_manager_tick(&screen->im);
+            if (screen->sync) {
+                sc_sync_tick(screen->sync);
+            }
             return;
         }
         case SDL_EVENT_WINDOW_EXPOSED:

@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -13,19 +14,23 @@
 # include <sys/select.h>
 #endif
 
+#include "android/input.h"
 #include "util/binary.h"
 #include "util/log.h"
 
 #define SC_SYNC_MAGIC 0x53435359u /* 'SCSY' */
-#define SC_SYNC_VERSION 1
+#define SC_SYNC_VERSION 2
 #define SC_SYNC_MAX_CLIENTS 16
 #define SC_SYNC_MAX_PACKET 256
+#define SC_SYNC_PEER_TIMEOUT_MS 2500
+#define SC_SYNC_HELLO_INTERVAL_MS 400
 
 enum sc_sync_msg_type {
     SC_SYNC_MSG_TOUCH = 1,
     SC_SYNC_MSG_SCROLL = 2,
     SC_SYNC_MSG_KEY = 3,
     SC_SYNC_MSG_BACK = 4,
+    SC_SYNC_MSG_HELLO = 5,
 };
 
 struct sc_sync_clients {
@@ -78,24 +83,60 @@ sc_sync_msg_is_supported(enum sc_control_msg_type type) {
     }
 }
 
+static void
+sc_sync_copy_name(char *dst, const char *src) {
+    memset(dst, 0, SC_SYNC_NAME_LEN);
+    if (!src || !src[0]) {
+        memcpy(dst, "scrcpy", 6);
+        return;
+    }
+    strncpy(dst, src, SC_SYNC_NAME_LEN - 1);
+}
+
+static const char *
+sc_sync_peer_name(struct sc_sync *sync, uint32_t id) {
+    for (size_t i = 0; i < sync->peer_count; ++i) {
+        if (sync->peers[i].id == id) {
+            return sync->peers[i].name;
+        }
+    }
+    return "?";
+}
+
+static void
+sc_sync_log(struct sc_sync *sync, const char *line) {
+    if (sync->on_log && line) {
+        sync->on_log(sync->log_userdata, line);
+    }
+}
+
+static size_t
+sc_sync_write_header(uint8_t *buf, uint8_t type, uint32_t source_id,
+                     uint32_t target_id) {
+    size_t o = 0;
+    sc_write32be(&buf[o], SC_SYNC_MAGIC);
+    o += 4;
+    buf[o++] = SC_SYNC_VERSION;
+    buf[o++] = type;
+    sc_write32be(&buf[o], source_id);
+    o += 4;
+    sc_write32be(&buf[o], target_id);
+    o += 4;
+    return o;
+}
+
 static size_t
 sc_sync_serialize(const struct sc_control_msg *msg, uint32_t source_id,
-                  uint8_t *buf, size_t bufsize) {
+                  uint32_t target_id, uint8_t *buf, size_t bufsize) {
     if (bufsize < SC_SYNC_MAX_PACKET) {
         return 0;
     }
 
     size_t o = 0;
-    sc_write32be(&buf[o], SC_SYNC_MAGIC);
-    o += 4;
-    buf[o++] = SC_SYNC_VERSION;
-    size_t type_off = o++;
-    sc_write32be(&buf[o], source_id);
-    o += 4;
-
     switch (msg->type) {
         case SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT: {
-            buf[type_off] = SC_SYNC_MSG_TOUCH;
+            o = sc_sync_write_header(buf, SC_SYNC_MSG_TOUCH, source_id,
+                                     target_id);
             const struct sc_position *pos = &msg->inject_touch_event.position;
             buf[o++] = (uint8_t) msg->inject_touch_event.action;
             sc_write32be(&buf[o], msg->inject_touch_event.action_button);
@@ -117,7 +158,8 @@ sc_sync_serialize(const struct sc_control_msg *msg, uint32_t source_id,
             break;
         }
         case SC_CONTROL_MSG_TYPE_INJECT_SCROLL_EVENT: {
-            buf[type_off] = SC_SYNC_MSG_SCROLL;
+            o = sc_sync_write_header(buf, SC_SYNC_MSG_SCROLL, source_id,
+                                     target_id);
             const struct sc_position *pos = &msg->inject_scroll_event.position;
             sc_write16be(&buf[o],
                          norm_u16(pos->point.x, pos->screen_size.width));
@@ -136,7 +178,8 @@ sc_sync_serialize(const struct sc_control_msg *msg, uint32_t source_id,
             break;
         }
         case SC_CONTROL_MSG_TYPE_INJECT_KEYCODE: {
-            buf[type_off] = SC_SYNC_MSG_KEY;
+            o = sc_sync_write_header(buf, SC_SYNC_MSG_KEY, source_id,
+                                     target_id);
             buf[o++] = (uint8_t) msg->inject_keycode.action;
             sc_write32be(&buf[o], msg->inject_keycode.keycode);
             o += 4;
@@ -147,7 +190,8 @@ sc_sync_serialize(const struct sc_control_msg *msg, uint32_t source_id,
             break;
         }
         case SC_CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON: {
-            buf[type_off] = SC_SYNC_MSG_BACK;
+            o = sc_sync_write_header(buf, SC_SYNC_MSG_BACK, source_id,
+                                     target_id);
             buf[o++] = (uint8_t) msg->back_or_screen_on.action;
             break;
         }
@@ -160,8 +204,10 @@ sc_sync_serialize(const struct sc_control_msg *msg, uint32_t source_id,
 
 static bool
 sc_sync_deserialize(const uint8_t *buf, size_t len, uint32_t *source_id,
-                    struct sc_control_msg *msg, struct sc_size frame_size) {
-    if (len < 10) {
+                    uint32_t *target_id, struct sc_control_msg *msg,
+                    struct sc_size frame_size, bool *is_hello, char *hello_name) {
+    *is_hello = false;
+    if (len < 14) {
         return false;
     }
 
@@ -180,6 +226,18 @@ sc_sync_deserialize(const uint8_t *buf, size_t len, uint32_t *source_id,
     uint8_t type = buf[o++];
     *source_id = sc_read32be(&buf[o]);
     o += 4;
+    *target_id = sc_read32be(&buf[o]);
+    o += 4;
+
+    if (type == SC_SYNC_MSG_HELLO) {
+        if (len < o + SC_SYNC_NAME_LEN) {
+            return false;
+        }
+        *is_hello = true;
+        memcpy(hello_name, &buf[o], SC_SYNC_NAME_LEN);
+        hello_name[SC_SYNC_NAME_LEN - 1] = '\0';
+        return true;
+    }
 
     memset(msg, 0, sizeof(*msg));
 
@@ -393,26 +451,101 @@ sc_sync_hub_thread(void *data) {
 }
 
 static void
-sc_sync_apply_remote(struct sc_sync *sync, const uint8_t *packet, size_t len) {
-    if (!sc_sync_is_enabled(sync) || !sync->controller) {
+sc_sync_note_peer(struct sc_sync *sync, uint32_t id, const char *name) {
+    if (id == sync->source_id) {
         return;
     }
 
+    uint32_t now = SDL_GetTicks();
+    sc_mutex_lock(&sync->mutex);
+    for (size_t i = 0; i < sync->peer_count; ++i) {
+        if (sync->peers[i].id == id) {
+            sc_sync_copy_name(sync->peers[i].name, name);
+            sync->peer_seen_ms[i] = now;
+            sc_mutex_unlock(&sync->mutex);
+            return;
+        }
+    }
+    if (sync->peer_count < SC_SYNC_MAX_PEERS) {
+        size_t i = sync->peer_count++;
+        sync->peers[i].id = id;
+        sync->peers[i].selected = false;
+        sc_sync_copy_name(sync->peers[i].name, name);
+        sync->peer_seen_ms[i] = now;
+    }
+    sc_mutex_unlock(&sync->mutex);
+}
+
+static const char *
+sc_sync_action_name(enum android_motionevent_action action) {
+    switch (action) {
+        case AMOTION_EVENT_ACTION_DOWN:
+            return "DOWN";
+        case AMOTION_EVENT_ACTION_UP:
+            return "UP";
+        case AMOTION_EVENT_ACTION_MOVE:
+            return "MOVE";
+        case AMOTION_EVENT_ACTION_POINTER_DOWN:
+            return "PDOWN";
+        case AMOTION_EVENT_ACTION_POINTER_UP:
+            return "PUP";
+        default:
+            return "TOUCH";
+    }
+}
+
+static void
+sc_sync_apply_remote(struct sc_sync *sync, const uint8_t *packet, size_t len) {
     sc_mutex_lock(&sync->mutex);
     struct sc_size frame_size = sync->frame_size;
     sc_mutex_unlock(&sync->mutex);
 
-    if (!frame_size.width || !frame_size.height) {
-        return;
-    }
-
     uint32_t source_id = 0;
+    uint32_t target_id = 0;
     struct sc_control_msg msg;
-    if (!sc_sync_deserialize(packet, len, &source_id, &msg, frame_size)) {
+    bool is_hello = false;
+    char hello_name[SC_SYNC_NAME_LEN];
+    if (!sc_sync_deserialize(packet, len, &source_id, &target_id, &msg,
+                             frame_size, &is_hello, hello_name)) {
         return;
     }
     if (source_id == sync->source_id) {
         return;
+    }
+
+    if (is_hello) {
+        sc_sync_note_peer(sync, source_id, hello_name);
+        return;
+    }
+
+    if (target_id != sync->source_id || !sync->controller) {
+        return;
+    }
+    if (!frame_size.width || !frame_size.height) {
+        return;
+    }
+
+    if (msg.type == SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
+            && msg.inject_touch_event.action != AMOTION_EVENT_ACTION_MOVE
+            && msg.inject_touch_event.action != AMOTION_EVENT_ACTION_HOVER_MOVE) {
+        char line[128];
+        sc_mutex_lock(&sync->mutex);
+        const char *from = sc_sync_peer_name(sync, source_id);
+        snprintf(line, sizeof(line), "<< %s  %s %d,%d", from,
+                 sc_sync_action_name(msg.inject_touch_event.action),
+                 msg.inject_touch_event.position.point.x,
+                 msg.inject_touch_event.position.point.y);
+        sc_mutex_unlock(&sync->mutex);
+        sc_sync_log(sync, line);
+    } else if (msg.type == SC_CONTROL_MSG_TYPE_INJECT_KEYCODE
+            && msg.inject_keycode.action == 0) {
+        char line[128];
+        sc_mutex_lock(&sync->mutex);
+        const char *from = sc_sync_peer_name(sync, source_id);
+        snprintf(line, sizeof(line), "<< %s  KEY %d", from,
+                 msg.inject_keycode.keycode);
+        sc_mutex_unlock(&sync->mutex);
+        sc_sync_log(sync, line);
     }
 
     sync->applying_remote = true;
@@ -454,9 +587,35 @@ sc_sync_client_thread(void *data) {
     return 0;
 }
 
+static bool
+sc_sync_send_packet(struct sc_sync *sync, const uint8_t *packet, size_t plen) {
+    if (sync->client == SC_SOCKET_NONE) {
+        return false;
+    }
+    uint8_t out[SC_SYNC_MAX_PACKET + 2];
+    sc_write16be(out, (uint16_t) plen);
+    memcpy(out + 2, packet, plen);
+    ssize_t w = net_send_all(sync->client, out, plen + 2);
+    return w == (ssize_t) (plen + 2);
+}
+
+static void
+sc_sync_send_hello(struct sc_sync *sync) {
+    uint8_t packet[SC_SYNC_MAX_PACKET];
+    size_t o = sc_sync_write_header(packet, SC_SYNC_MSG_HELLO, sync->source_id,
+                                    0);
+    sc_mutex_lock(&sync->mutex);
+    memcpy(&packet[o], sync->display_name, SC_SYNC_NAME_LEN);
+    sc_mutex_unlock(&sync->mutex);
+    o += SC_SYNC_NAME_LEN;
+    if (!sc_sync_send_packet(sync, packet, o)) {
+        LOGW("sync: could not send hello");
+    }
+}
+
 bool
 sc_sync_init(struct sc_sync *sync, struct sc_controller *controller,
-             uint16_t port) {
+             uint16_t port, const char *display_name) {
     memset(sync, 0, sizeof(*sync));
     sync->controller = controller;
     sync->port = port ? port : SC_SYNC_DEFAULT_PORT;
@@ -464,6 +623,7 @@ sc_sync_init(struct sc_sync *sync, struct sc_controller *controller,
     sync->client = SC_SOCKET_NONE;
     sync->source_id =
         (uint32_t) SDL_GetTicks() ^ (uint32_t) (uintptr_t) sync;
+    sc_sync_copy_name(sync->display_name, display_name);
 
     return sc_mutex_init(&sync->mutex);
 }
@@ -525,6 +685,8 @@ sc_sync_start(struct sc_sync *sync) {
     }
 
     sync->started = true;
+    sc_sync_send_hello(sync);
+    sync->hello_last_ms = SDL_GetTicks();
     LOGI("Input sync ready (port %" PRIu16 ", %s)", sync->port,
          sync->is_hub ? "hub" : "peer");
     return true;
@@ -549,7 +711,6 @@ sc_sync_stop(struct sc_sync *sync) {
         }
         sync->started = false;
     } else if (sync->is_hub) {
-        // hub thread started but client failed
         sc_thread_join(&sync->hub_thread, NULL);
         sync->is_hub = false;
     }
@@ -571,19 +732,91 @@ sc_sync_destroy(struct sc_sync *sync) {
 }
 
 void
-sc_sync_set_enabled(struct sc_sync *sync, bool enabled) {
+sc_sync_set_log_fn(struct sc_sync *sync,
+                   void (*on_log)(void *userdata, const char *line),
+                   void *userdata) {
+    sync->on_log = on_log;
+    sync->log_userdata = userdata;
+}
+
+void
+sc_sync_tick(struct sc_sync *sync) {
+    if (!sync || !sync->started) {
+        return;
+    }
+
+    uint32_t now = SDL_GetTicks();
+    if (now - sync->hello_last_ms >= SC_SYNC_HELLO_INTERVAL_MS) {
+        sc_sync_send_hello(sync);
+        sync->hello_last_ms = now;
+    }
+
     sc_mutex_lock(&sync->mutex);
-    sync->enabled = enabled;
+    size_t i = 0;
+    while (i < sync->peer_count) {
+        if (now - sync->peer_seen_ms[i] > SC_SYNC_PEER_TIMEOUT_MS) {
+            sync->peers[i] = sync->peers[sync->peer_count - 1];
+            sync->peer_seen_ms[i] = sync->peer_seen_ms[sync->peer_count - 1];
+            --sync->peer_count;
+            continue;
+        }
+        ++i;
+    }
     sc_mutex_unlock(&sync->mutex);
-    LOGI("Input sync %s", enabled ? "ON" : "OFF");
+}
+
+size_t
+sc_sync_copy_peers(struct sc_sync *sync, struct sc_sync_peer *out, size_t max) {
+    if (!sync || !out || !max) {
+        return 0;
+    }
+    sc_mutex_lock(&sync->mutex);
+    size_t n = MIN(sync->peer_count, max);
+    for (size_t i = 0; i < n; ++i) {
+        out[i] = sync->peers[i];
+    }
+    sc_mutex_unlock(&sync->mutex);
+    return n;
 }
 
 bool
-sc_sync_is_enabled(struct sc_sync *sync) {
+sc_sync_toggle_target(struct sc_sync *sync, uint32_t peer_id) {
+    if (!sync) {
+        return false;
+    }
+    bool selected = false;
+    bool found = false;
     sc_mutex_lock(&sync->mutex);
-    bool enabled = sync->enabled;
+    for (size_t i = 0; i < sync->peer_count; ++i) {
+        if (sync->peers[i].id == peer_id) {
+            sync->peers[i].selected = !sync->peers[i].selected;
+            selected = sync->peers[i].selected;
+            found = true;
+            break;
+        }
+    }
     sc_mutex_unlock(&sync->mutex);
-    return enabled;
+    if (found) {
+        LOGI("Input sync target %s", selected ? "ON" : "OFF");
+    }
+    return found;
+}
+
+bool
+sc_sync_has_targets(struct sc_sync *sync) {
+    if (!sync) {
+        return false;
+    }
+    sc_mutex_lock(&sync->mutex);
+    bool any = false;
+    for (size_t i = 0; i < sync->peer_count; ++i) {
+        if (sync->peers[i].selected) {
+            any = true;
+            break;
+        }
+    }
+    sc_mutex_unlock(&sync->mutex);
+    return any;
 }
 
 void
@@ -598,9 +831,6 @@ sc_sync_broadcast(struct sc_sync *sync, const struct sc_control_msg *msg) {
     if (!sync || !sync->started || sync->applying_remote) {
         return;
     }
-    if (!sc_sync_is_enabled(sync)) {
-        return;
-    }
     if (!sc_sync_msg_is_supported(msg->type)) {
         return;
     }
@@ -608,19 +838,44 @@ sc_sync_broadcast(struct sc_sync *sync, const struct sc_control_msg *msg) {
         return;
     }
 
-    uint8_t packet[SC_SYNC_MAX_PACKET];
-    size_t plen =
-        sc_sync_serialize(msg, sync->source_id, packet, sizeof(packet));
-    if (!plen) {
+    uint32_t targets[SC_SYNC_MAX_PEERS];
+    char names[SC_SYNC_MAX_PEERS][SC_SYNC_NAME_LEN];
+    size_t n = 0;
+    sc_mutex_lock(&sync->mutex);
+    for (size_t i = 0; i < sync->peer_count; ++i) {
+        if (sync->peers[i].selected) {
+            targets[n] = sync->peers[i].id;
+            memcpy(names[n], sync->peers[i].name, SC_SYNC_NAME_LEN);
+            ++n;
+        }
+    }
+    sc_mutex_unlock(&sync->mutex);
+    if (!n) {
         return;
     }
 
-    uint8_t out[SC_SYNC_MAX_PACKET + 2];
-    sc_write16be(out, (uint16_t) plen);
-    memcpy(out + 2, packet, plen);
+    bool log_touch = msg->type == SC_CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT
+            && msg->inject_touch_event.action != AMOTION_EVENT_ACTION_MOVE
+            && msg->inject_touch_event.action != AMOTION_EVENT_ACTION_HOVER_MOVE;
 
-    ssize_t w = net_send_all(sync->client, out, plen + 2);
-    if (w != (ssize_t) (plen + 2)) {
-        LOGW("sync: could not broadcast message");
+    for (size_t i = 0; i < n; ++i) {
+        uint8_t packet[SC_SYNC_MAX_PACKET];
+        size_t plen = sc_sync_serialize(msg, sync->source_id, targets[i],
+                                        packet, sizeof(packet));
+        if (!plen) {
+            continue;
+        }
+        if (!sc_sync_send_packet(sync, packet, plen)) {
+            LOGW("sync: could not send to %s", names[i]);
+            continue;
+        }
+        if (log_touch) {
+            char line[128];
+            snprintf(line, sizeof(line), ">> %s  %s %d,%d", names[i],
+                     sc_sync_action_name(msg->inject_touch_event.action),
+                     msg->inject_touch_event.position.point.x,
+                     msg->inject_touch_event.position.point.y);
+            sc_sync_log(sync, line);
+        }
     }
 }

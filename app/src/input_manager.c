@@ -1109,6 +1109,9 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
 
     assert(im->mp->ops->process_mouse_click);
     im->mp->ops->process_mouse_click(im->mp, &evt);
+    sc_screen_log_input(im->screen, "%s %d,%d",
+                        down ? "DOWN" : "UP",
+                        evt.position.point.x, evt.position.point.y);
 
     if (im->mp->relative_mode) {
         assert(!im->vfinger_down); // vfinger must not be used in relative mode

@@ -319,6 +319,11 @@ set_terminal_title_with_prefix(const char *value) {
     sc_term_set_title(title);
 }
 
+static void
+sc_sync_log_to_screen(void *userdata, const char *line) {
+    sc_screen_log_input(userdata, "%s", line);
+}
+
 enum scrcpy_exit_code
 scrcpy(struct scrcpy_options *options) {
     static struct scrcpy scrcpy;
@@ -608,7 +613,8 @@ scrcpy(struct scrcpy_options *options) {
         controller_initialized = true;
 
         if (options->sync && options->window) {
-            if (!sc_sync_init(&s->sync, &s->controller, options->sync_port)) {
+            if (!sc_sync_init(&s->sync, &s->controller, options->sync_port,
+                              window_title)) {
                 goto end;
             }
             sync_initialized = true;
@@ -808,6 +814,9 @@ aoa_complete:
             goto end;
         }
         screen_initialized = true;
+        if (sync_initialized) {
+            sc_sync_set_log_fn(&s->sync, sc_sync_log_to_screen, &s->screen);
+        }
 
         if (options->video_playback) {
             struct sc_frame_source *src = &s->video_decoder.frame_source;
