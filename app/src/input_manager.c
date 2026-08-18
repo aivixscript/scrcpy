@@ -374,10 +374,24 @@ sc_input_manager_process_text_input(struct sc_input_manager *im,
     im->kp->ops->process_text(im->kp, &evt);
 }
 
+static struct sc_point
+sc_point_clamp(struct sc_point point, struct sc_size size) {
+    if (point.x < 0) {
+        point.x = 0;
+    } else if (size.width && point.x >= size.width) {
+        point.x = size.width - 1;
+    }
+    if (point.y < 0) {
+        point.y = 0;
+    } else if (size.height && point.y >= size.height) {
+        point.y = size.height - 1;
+    }
+    return point;
+}
+
 static bool
-simulate_virtual_finger(struct sc_input_manager *im,
-                        enum android_motionevent_action action,
-                        struct sc_point point) {
+inject_finger(struct sc_input_manager *im, uint64_t pointer_id,
+              enum android_motionevent_action action, struct sc_point point) {
     bool up = action == AMOTION_EVENT_ACTION_UP;
 
     struct sc_control_msg msg;
@@ -385,17 +399,89 @@ simulate_virtual_finger(struct sc_input_manager *im,
     msg.inject_touch_event.action = action;
     msg.inject_touch_event.position.screen_size = im->screen->frame_size;
     msg.inject_touch_event.position.point = point;
-    msg.inject_touch_event.pointer_id = SC_POINTER_ID_VIRTUAL_FINGER;
+    msg.inject_touch_event.pointer_id = pointer_id;
     msg.inject_touch_event.pressure = up ? 0.0f : 1.0f;
     msg.inject_touch_event.action_button = 0;
     msg.inject_touch_event.buttons = 0;
 
     if (!sc_controller_push_msg(im->controller, &msg)) {
-        LOGW("Could not request 'inject virtual finger event'");
+        LOGW("Could not inject touch event");
         return false;
     }
 
     return true;
+}
+
+static bool
+simulate_virtual_finger(struct sc_input_manager *im,
+                        enum android_motionevent_action action,
+                        struct sc_point point) {
+    return inject_finger(im, SC_POINTER_ID_VIRTUAL_FINGER, action, point);
+}
+
+static void
+simulate_wheel_swipe(struct sc_input_manager *im, struct sc_point start,
+                     float hscroll, float vscroll) {
+    struct sc_size size = im->screen->frame_size;
+    int32_t step = (int32_t) (MIN(size.width, size.height) * 0.10f);
+    if (step < 48) {
+        step = 48;
+    }
+
+    struct sc_point end = start;
+    end.x += (int32_t) (hscroll * step);
+    end.y += (int32_t) (vscroll * step);
+    end = sc_point_clamp(end, size);
+
+    inject_finger(im, SC_POINTER_ID_GENERIC_FINGER, AMOTION_EVENT_ACTION_DOWN,
+                  start);
+    inject_finger(im, SC_POINTER_ID_GENERIC_FINGER, AMOTION_EVENT_ACTION_MOVE,
+                  end);
+    inject_finger(im, SC_POINTER_ID_GENERIC_FINGER, AMOTION_EVENT_ACTION_UP,
+                  end);
+}
+
+static void
+simulate_wheel_pinch(struct sc_input_manager *im, struct sc_point center,
+                     float vscroll) {
+    struct sc_size size = im->screen->frame_size;
+    int32_t base = (int32_t) (MIN(size.width, size.height) * 0.10f);
+    if (base < 48) {
+        base = 48;
+    }
+    int32_t delta = (int32_t) (MIN(size.width, size.height) * 0.06f);
+    if (delta < 28) {
+        delta = 28;
+    }
+
+    // Wheel up (vscroll > 0) -> zoom in (fingers move apart)
+    int32_t d0 = base;
+    int32_t d1 = vscroll > 0 ? base + delta : base - delta;
+    if (d1 < 20) {
+        d1 = 20;
+    }
+
+    struct sc_point f1s = sc_point_clamp(
+        (struct sc_point) {center.x + d0, center.y + d0}, size);
+    struct sc_point f2s = sc_point_clamp(
+        (struct sc_point) {center.x - d0, center.y - d0}, size);
+    struct sc_point f1e = sc_point_clamp(
+        (struct sc_point) {center.x + d1, center.y + d1}, size);
+    struct sc_point f2e = sc_point_clamp(
+        (struct sc_point) {center.x - d1, center.y - d1}, size);
+
+    inject_finger(im, SC_POINTER_ID_GENERIC_FINGER, AMOTION_EVENT_ACTION_DOWN,
+                  f1s);
+    inject_finger(im, SC_POINTER_ID_VIRTUAL_FINGER, AMOTION_EVENT_ACTION_DOWN,
+                  f2s);
+    inject_finger(im, SC_POINTER_ID_GENERIC_FINGER, AMOTION_EVENT_ACTION_MOVE,
+                  f1e);
+    inject_finger(im, SC_POINTER_ID_VIRTUAL_FINGER, AMOTION_EVENT_ACTION_MOVE,
+                  f2e);
+    inject_finger(im, SC_POINTER_ID_VIRTUAL_FINGER, AMOTION_EVENT_ACTION_UP,
+                  f2e);
+    inject_finger(im, SC_POINTER_ID_GENERIC_FINGER, AMOTION_EVENT_ACTION_UP,
+                  f1e);
 }
 
 static struct sc_point
@@ -1017,29 +1103,46 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
 static void
 sc_input_manager_process_mouse_wheel(struct sc_input_manager *im,
                                      const SDL_MouseWheelEvent *event) {
-    if (im->camera || !im->kp || im->screen->paused || im->disconnected) {
+    if (im->camera || !im->controller || !im->mp || im->screen->paused
+            || im->disconnected) {
         return;
     }
 
-    if (!im->mp->ops->process_mouse_scroll) {
-        // The mouse processor does not support scroll events
+    if (im->mouse_buttons_state || im->vfinger_down || im->mp->relative_mode) {
         return;
     }
 
-    // mouse_x and mouse_y are expressed in pixels relative to the window
-    float mouse_x;
-    float mouse_y;
-    uint32_t buttons = SDL_GetMouseState(&mouse_x, &mouse_y);
-    (void) buttons; // Actual buttons are tracked manually to ignore shortcuts
+    float h = event->integer_x ? (float) event->integer_x : event->x;
+    float v = event->integer_y ? (float) event->integer_y : event->y;
+    if (h == 0.f && v == 0.f) {
+        return;
+    }
+    if (h > 0.f && h < 1.f) {
+        h = 1.f;
+    } else if (h < 0.f && h > -1.f) {
+        h = -1.f;
+    }
+    if (v > 0.f && v < 1.f) {
+        v = 1.f;
+    } else if (v < 0.f && v > -1.f) {
+        v = -1.f;
+    }
 
-    struct sc_mouse_scroll_event evt = {
-        .position = sc_input_manager_get_position(im, mouse_x, mouse_y),
-        .hscroll = event->x,
-        .vscroll = event->y,
-        .buttons_state = im->mouse_buttons_state,
-    };
+    struct sc_point point =
+        sc_screen_convert_window_to_frame_coords(im->screen, event->mouse_x,
+                                                 event->mouse_y);
 
-    im->mp->ops->process_mouse_scroll(im->mp, &evt);
+    SDL_Keymod keymod = SDL_GetModState();
+    if (keymod & SDL_KMOD_CTRL) {
+        // Ctrl + wheel: pinch-to-zoom (games / maps)
+        if (v != 0.f) {
+            simulate_wheel_pinch(im, point, v);
+        }
+        return;
+    }
+
+    // Games ignore ACTION_SCROLL; emulate a one-finger drag instead
+    simulate_wheel_swipe(im, point, h, v);
 }
 
 static void

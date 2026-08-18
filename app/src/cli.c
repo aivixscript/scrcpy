@@ -719,7 +719,7 @@ static const struct sc_option options[] = {
         .longopt = "sync-port",
         .argdesc = "port",
         .text = "TCP port for multi-instance input sync on localhost.\n"
-                "Default is 27183.",
+                "Default is 27583.",
     },
     {
         .longopt_id = OPT_ORIENTATION,

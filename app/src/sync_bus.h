@@ -12,7 +12,7 @@
 #include "util/net.h"
 #include "util/thread.h"
 
-#define SC_SYNC_DEFAULT_PORT 27183
+#define SC_SYNC_DEFAULT_PORT 27583
 
 struct sc_sync {
     bool enabled; // SYNC button state

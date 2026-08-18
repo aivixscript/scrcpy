@@ -124,7 +124,7 @@ const struct scrcpy_options scrcpy_options_default = {
     .ignore_video_encoder_constraints = false,
     .update_terminal_title = true,
     .sync = true,
-    .sync_port = 27183,
+    .sync_port = 27583,
 };
 
 enum sc_orientation
