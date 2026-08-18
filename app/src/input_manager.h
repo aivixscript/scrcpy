@@ -9,11 +9,18 @@
 #include <SDL3/SDL_keycode.h>
 
 #include "controller.h"
+#include "coords.h"
 #include "file_pusher.h"
 #include "options.h"
 #include "trait/gamepad_processor.h"
 #include "trait/key_processor.h"
 #include "trait/mouse_processor.h"
+
+enum sc_wheel_gesture {
+    SC_WHEEL_GESTURE_NONE = 0,
+    SC_WHEEL_GESTURE_SWIPE,
+    SC_WHEEL_GESTURE_PINCH,
+};
 
 struct sc_input_manager {
     struct sc_controller *controller;
@@ -48,6 +55,16 @@ struct sc_input_manager {
     uint64_t next_sequence; // used for request acknowledgements
 
     bool disconnected;
+
+    // Mouse wheel as a held touch gesture (games treat instant DOWN/UP as a tap)
+    enum sc_wheel_gesture wheel_gesture;
+    struct sc_point wheel_pos;
+    struct sc_point wheel_pinch_center;
+    float wheel_pinch_spread;
+    float wheel_pending_x;
+    float wheel_pending_y;
+    float wheel_pending_spread;
+    uint32_t wheel_last_ms;
 };
 
 struct sc_input_manager_params {
@@ -72,5 +89,8 @@ sc_input_manager_init(struct sc_input_manager *im,
 void
 sc_input_manager_handle_event(struct sc_input_manager *im,
                               const SDL_Event *event);
+
+void
+sc_input_manager_tick(struct sc_input_manager *im);
 
 #endif

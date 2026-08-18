@@ -1482,6 +1482,7 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
             if (!ok) {
                 LOGE("Frame update failed\n");
             }
+            sc_input_manager_tick(&screen->im);
             return;
         }
         case SDL_EVENT_WINDOW_EXPOSED:
